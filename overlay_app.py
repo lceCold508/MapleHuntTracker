@@ -32,7 +32,7 @@ from timed_exp import ExpTimerSet, TIMERS, LABELS
 from haste_buff import HasteMatcher, HasteState, beep_haste_expired
 
 
-VERSION = "1.9.4"
+VERSION = "1.9.5"
 APP_NAME = "글클메 사냥 트래커"
 BASE = Path(os.environ.get("MAPLE_TRACKER_DATA_DIR") or
             (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MapleHuntTracker"))
@@ -88,6 +88,17 @@ def experience_progress(level: int, current_exp: int | None) -> tuple[int | None
     if current_exp is None or not 0 <= current_exp <= needed:
         return needed, None
     return needed, needed - current_exp
+
+
+def exp_rejection_reason(hunt: HuntSession, level: int, exp: int) -> str | None:
+    """Reject likely OCR errors before they reach the session/rate engine."""
+    if exp == 0 and (hunt.current_exp is None or level == hunt.level):
+        return "EXP 0 오인식 무시"
+    if level < hunt.level:
+        return "이전 레벨 OCR 무시"
+    if level == hunt.level and hunt.current_exp is not None and exp < hunt.current_exp:
+        return "EXP 감소 오인식 무시"
+    return None
 
 
 def virtual_screen() -> tuple[int, int, int, int]:
@@ -437,6 +448,7 @@ class OverlayApp(tk.Tk):
         levelup_hits = 0
         last_valid_scan = None
         last_full_probe = 0.0
+        last_rejection_notice = -1e9
         recovery = RecoveryPolicy()
         while not self.stop_event.is_set():
             began = time.monotonic()
@@ -453,6 +465,7 @@ class OverlayApp(tk.Tk):
                     startup_hits = 0
                     levelup_hits = 0
                     last_valid_scan = None
+                    last_rejection_notice = -1e9
                     recovery = RecoveryPolicy()
                 if self.rescan_event.is_set():
                     self.rescan_event.clear()
@@ -524,6 +537,14 @@ class OverlayApp(tk.Tk):
                         wide = crop_game_region(frame, wide_roi)
                         if wide is not None:
                             result = read_exp(wide, current_level, hunt.current_exp)
+                if result is not None:
+                    reason = exp_rejection_reason(hunt, current_level, result[0])
+                    if reason:
+                        now = time.monotonic()
+                        if now - last_rejection_notice >= 2:
+                            self.event_queue.put(("exp_rejected", session_id, reason))
+                            last_rejection_notice = now
+                        result = None
                 if result is not None:
                     recovery.success()
                     last_valid_scan = time.monotonic()
@@ -614,6 +635,13 @@ class OverlayApp(tk.Tk):
                             self.config_data["level"] = level
                             save_config(self.config_data)
                         changed = True
+                    else:
+                        self.scan_status = "비정상 EXP 인식값 무시"
+                        changed = True
+                elif kind == "exp_rejected":
+                    if self.session is not None and message[1] == id(self.session):
+                        self.scan_status = message[2]
+                        changed = True
                 elif kind == "status":
                     self.scan_status = message[1]
                     changed = True
@@ -690,6 +718,8 @@ class OverlayApp(tk.Tk):
             state, color = "일시정지", MUTED
         elif age is not None and age < 4.0:
             state, color = "인식 정상", ACCENT
+        elif self.scan_status in ("EXP 0 오인식 무시", "EXP 감소 오인식 무시"):
+            state, color = "EXP 오인식 차단 중", WARNING
         elif age is not None and age >= 4.0:
             state, color = "재스캔 중", ERROR
         else:

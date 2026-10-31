@@ -210,17 +210,27 @@ class HuntSession:
         limit = requirement(level)
         if limit and exp >= limit:
             return False
+        # The game's OCR occasionally emits "0 (0%)" despite nonzero EXP.
+        # v1.9.4 accepted that sample as genuine same-level EXP loss, making
+        # the live total and the 6/10/30/60-minute timers negative. A new
+        # session must also never anchor on this false zero and then mistake
+        # the next good 12,000+ EXP reading for a huge hunting gain. The
+        # first real positive EXP reading provides a trustworthy baseline.
+        if exp == 0 and (self.current_exp is None or level == self.level):
+            return False
         if self.latest_total_exp is not None:
             delta = total - self.latest_total_exp
             # Level drop or OCR outliers: require explicit new session.
             if level < self.level:
                 return False
+            # Same-level EXP is monotonic during normal hunting. Even minor
+            # negative OCR jumps (<500 EXP) corrupted rolling-rate readings.
+            # A real death penalty is not automatically counted: use the
+            # visible "새 세션" control to re-anchor after losing EXP.
+            if level == self.level and delta < 0:
+                return False
             # One OCR reading cannot plausibly supply >1.5 full levels.
             if delta > max(25000, int((limit or 10000) * 1.5)):
-                return False
-            # EXP losses on death can be genuine; ignore only extremely large
-            # backwards jumps with a mismatch against the percentage.
-            if delta < -max(5000, (limit or 10000) // 2):
                 return False
         if self.total_exp_base is None:
             self.total_exp_base = total
