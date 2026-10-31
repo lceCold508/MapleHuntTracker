@@ -16,9 +16,9 @@ qa-*/
 *.7z
 
 # Old version-specific build manifests remain on disk for rollback;
-# the current v1.9.5 manifest is the only one stored in this repository.
+# the current v1.9.6 manifest is the only one stored in this repository.
 MapleHuntTracker*.spec
-!MapleHuntTracker_v1_9_5.spec
+!MapleHuntTracker_v1_9_6.spec
 
 # Local session records / private machine settings
 settings.json

@@ -30,9 +30,10 @@ from screen import (
 from window_capture import GameWindowCapture
 from timed_exp import ExpTimerSet, TIMERS, LABELS
 from haste_buff import HasteMatcher, HasteState, beep_haste_expired
+from exp_picker import ExpRegionPicker
 
 
-VERSION = "1.9.5"
+VERSION = "1.9.6"
 APP_NAME = "글클메 사냥 트래커"
 BASE = Path(os.environ.get("MAPLE_TRACKER_DATA_DIR") or
             (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MapleHuntTracker"))
@@ -745,6 +746,8 @@ class OverlayApp(tk.Tk):
         self.withdraw()
 
         def capture():
+            if self._closing:
+                return
             try:
                 snapshot, _ = self.capture.full_snapshot()
                 if snapshot is None:
@@ -754,57 +757,14 @@ class OverlayApp(tk.Tk):
                 messagebox.showerror("캡처 실패", str(error), parent=self)
                 return
             self.deiconify()
-            sw = max(600, min(self.winfo_screenwidth() - 100, 1400))
-            sh = max(400, min(self.winfo_screenheight() - 180, 900))
-            scale = min(sw / snapshot.width, sh / snapshot.height)
-            display = snapshot.resize((int(snapshot.width * scale), int(snapshot.height * scale)),
-                                      Image.Resampling.BILINEAR)
-            win = tk.Toplevel(self)
+            win = ExpRegionPicker(self, snapshot, self.exp_roi, self._save_region)
             self._picker_window = win
-            win.title("경험치 OCR 영역 선택")
-            win.configure(bg=HEADER)
-            win.attributes("-topmost", True)
-            win.geometry(f"{display.width + 18}x{display.height + 55}")
-            self._label(win, "게임 하단의 EXP 숫자와 %를 함께 드래그해 주세요 · ESC 취소",
-                        11, FG, bg=HEADER).pack(pady=7)
-            canvas = tk.Canvas(win, width=display.width, height=display.height,
-                               highlightthickness=0, bd=0)
-            canvas.pack()
-            win.image_ref = ImageTk.PhotoImage(display)
-            canvas.create_image(0, 0, image=win.image_ref, anchor="nw")
-            selected = [None]
-            rectangle = [None]
+            def reset_picker(event):
+                if event.widget is win:
+                    self._picker_window = None
+            win.bind("<Destroy>", reset_picker, add="+")
 
-            def down(event):
-                selected[0] = (event.x, event.y)
-                if rectangle[0]:
-                    canvas.delete(rectangle[0])
-                rectangle[0] = canvas.create_rectangle(event.x, event.y, event.x,
-                                                       event.y, outline="#8efaac", width=3)
-
-            def move(event):
-                if selected[0] and rectangle[0]:
-                    canvas.coords(rectangle[0], *selected[0], event.x, event.y)
-
-            def up(event):
-                if not selected[0]:
-                    return
-                x1, x2 = sorted((selected[0][0], event.x))
-                y1, y2 = sorted((selected[0][1], event.y))
-                if x2 - x1 < 16 or y2 - y1 < 10:
-                    return
-                roi = [max(0, x1 / display.width), max(0, y1 / display.height),
-                       min(1, x2 / display.width), min(1, y2 / display.height)]
-                self._save_region(roi)
-                win.destroy()
-                self._picker_window = None
-
-            canvas.bind("<ButtonPress-1>", down)
-            canvas.bind("<B1-Motion>", move)
-            canvas.bind("<ButtonRelease-1>", up)
-            win.bind("<Escape>", lambda _: win.destroy())
-
-        self.after(250, capture)
+        self.after(350, capture)
 
     def show_settings(self):
         if self._settings_window and self._settings_window.winfo_exists():
@@ -1019,6 +979,17 @@ def ui_test():
         assert len(beep_calls) == 1
         assert app.haste_sound_text.cget("text") == "종료 알림 꺼짐"
         assert app.attributes("-topmost") == 1
+        # Also exercise the packaged high-resolution EXP picker UI. The
+        # original full-screen thumbnail made EXP text unreadably small.
+        picker = ExpRegionPicker(app, Image.new("RGB", (3840, 2160), "#172231"),
+                                 list(DEFAULT_EXP_REGION), lambda roi: None)
+        app.update()
+        picker.render()
+        assert picker.view is not None
+        assert picker.view.zoom >= 1.5
+        assert picker.image_ref is not None
+        assert picker.image_ref.width() == picker.canvas.winfo_width()
+        picker.destroy()
         # Tk waits until mapped to lay out overrideredirect children.
         app.update()
         app.update_idletasks()
