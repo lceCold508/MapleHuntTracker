@@ -1,0 +1,34 @@
+# Virtual environments and Python caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated packages, screenshots, and local QA runs
+build/
+dist/
+debug/
+qa-*/
+*.log
+*.exe
+*.zip
+*.7z
+
+# Old version-specific build manifests remain on disk for rollback;
+# the current v1.9.4 manifest is the only one stored in this repository.
+MapleHuntTracker*.spec
+!MapleHuntTracker_v1_9_4.spec
+
+# Local session records / private machine settings
+settings.json
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

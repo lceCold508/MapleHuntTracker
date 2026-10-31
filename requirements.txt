@@ -1,0 +1,7 @@
+Pillow>=11.0
+customtkinter==5.2.2
+winocr==0.0.15
+pyinstaller==6.22.3
+windows-capture==2.0.1
+numpy>=1.26
+opencv-python>=4.9
