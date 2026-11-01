@@ -34,7 +34,7 @@ from exp_picker import ExpRegionPicker
 from diagnostics import DiagnosticJournal
 
 
-VERSION = "1.9.8"
+VERSION = "1.9.10"
 APP_NAME = "글클메 사냥 트래커"
 BASE = Path(os.environ.get("MAPLE_TRACKER_DATA_DIR") or
             (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MapleHuntTracker"))
@@ -45,11 +45,14 @@ POLL_INTERVAL = 0.50
 UI_INTERVAL_MS = 100
 BG = "#111923"
 HEADER = "#1a2633"
-# Windows' layered-window chroma key makes only the backdrop invisible.
-# Text and buttons remain at 100% opacity (unlike wm_attributes('-alpha')).
+# The front HUD uses this chroma key with 100%-opaque text. A separate dark
+# semi-transparent window BELOW it restores the readable v1.9.7 card style.
 TRANSPARENT_KEY = "#010203"
-FG = "#f4f7fa"
-MUTED = "#97a8b6"
+FG = "#ffffff"
+# Former secondary text (#97a8b6) is hard to read over a 55%-opaque
+# backdrop and very bright Maple scenery. Use a nearly white, solid color
+# even for 'secondary' labels. Alpha remains 100%, independent of backdrop.
+MUTED = "#f1f6ff"
 ACCENT = "#8efaac"
 WARNING = "#ffbf70"
 ERROR = "#ff7b88"
@@ -60,16 +63,17 @@ def load_config() -> dict:
         "level": 31, "map": "사냥터 미지정",
         "exp_roi": list(DEFAULT_EXP_REGION),
         "always_top": True, "overlay_alpha": 0.55,
-        "transparent_bg": True,
+        "backdrop_enabled": True,
         "auto_rescan": True, "haste_alert": True,
     }
     try:
         value = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if isinstance(value, dict):
             defaults.update(value)
-            # On upgrade, default to the user's preferred minimum backdrop
-            # opacity in case they explicitly switch off full transparency.
-            if "transparent_bg" not in value:
+            # v1.9.8's fully invisible background was hard to read. Always
+            # migrate to the familiar shaded backdrop, while preserving
+            # level, map, EXP selection, position and all existing records.
+            if "backdrop_enabled" not in value:
                 defaults["overlay_alpha"] = 0.55
     except (OSError, ValueError, TypeError):
         pass
@@ -199,17 +203,28 @@ class OverlayApp(tk.Tk):
         self._picker_window = None
         self._closing = False
         self._hud_original_styles = []
+        self._backdrop_window = None
+        self._backdrop_canvas = None
+        self._backdrop_last_geometry = None
+        self._backdrop_needs_paint = True
         x, y = safe_position(self.config_data.get("overlay_geometry"), game_info())
         self.geometry(f"{WIDTH}x{HEIGHT}+{x}+{y}")
         self.attributes("-topmost", bool(self.config_data.get("always_top", True)))
         self._make_ui()
         self._remember_hud_styles()
-        self._apply_hud_transparency(bool(self.config_data.get("transparent_bg", True)))
+        self._prepare_opaque_text_layer()
+        self._create_backdrop()
         self.bind("<Button-3>", self._open_menu)
         self.bind("<Control-r>", lambda _: self.rescan())
         self.bind("<Escape>", lambda _: None)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.deiconify()
+        # Geometry is still 0,0 before Tk lays out the mapped root window.
+        # Resolve its real monitor position before displaying the background.
+        self.update_idletasks()
+        self._sync_backdrop_geometry()
+        self._apply_backdrop(bool(self.config_data.get("backdrop_enabled", True)))
+        self.after(120, self._paint_backdrop)
         self._show_values()
         if start_session:
             self.start_new_session()
@@ -264,55 +279,148 @@ class OverlayApp(tk.Tk):
 
         visit(self)
 
-    def _apply_hud_transparency(self, transparent: bool, opacity: float | None = None):
-        """Hide ONLY the HUD background; keep RGB text opaque and readable.
-
-        On Windows, -transparentcolor makes only pixels with the matching
-        background RGB transparent. -alpha must be 1 to keep EXP labels crisp.
-        Reverting to legacy mode restores original frame/card fills.
-        """
+    def _prepare_opaque_text_layer(self):
+        """Leave all text at 100% opacity and expose the dark window below."""
         self.attributes("-transparentcolor", "")
         self.attributes("-alpha", 1.0)
-        self.configure(bg=TRANSPARENT_KEY if transparent else BG)
+        self.configure(bg=TRANSPARENT_KEY)
         for widget, original in self._hud_original_styles:
             if not widget.winfo_exists():
                 continue
             opts = dict(original)
-            if transparent:
-                for field in ("background", "activebackground", "highlightbackground",
-                              "highlightcolor"):
-                    if field in opts:
-                        opts[field] = TRANSPARENT_KEY
-                for field in ("highlightthickness", "borderwidth"):
-                    if field in opts:
-                        opts[field] = 0
+            for field in ("background", "activebackground", "highlightbackground",
+                          "highlightcolor"):
+                if field in opts:
+                    opts[field] = TRANSPARENT_KEY
+            for field in ("highlightthickness", "borderwidth"):
+                if field in opts:
+                    opts[field] = 0
             if opts:
                 widget.configure(**opts)
-        if transparent:
-            # Set the chroma key last so widget updates never flash over the
-            # game. Tk's normal Toplevel dialogs use their own opaque HWNDs.
-            self.attributes("-transparentcolor", TRANSPARENT_KEY)
+        self.attributes("-transparentcolor", TRANSPARENT_KEY)
+
+    def _create_backdrop(self):
+        """A separate shaded window lets labels remain fully opaque.
+
+        Tk's '-alpha' dims the entire window, including its text. Instead the
+        backing window alone is alpha-blended; the foreground remains an
+        opaque-color-key window. The backdrop is mouse-transparent.
+        """
+        window = tk.Toplevel(self)
+        window.withdraw()
+        window.overrideredirect(True)
+        window.configure(bg=BG)
+        window.attributes("-alpha", clamp_alpha(self.config_data.get("overlay_alpha", .55)))
+        window.attributes("-topmost", bool(self.config_data.get("always_top", True)))
+        self._backdrop_window = window
+        canvas = tk.Canvas(window, highlightthickness=0, bd=0, bg=BG)
+        canvas.pack(fill="both", expand=True)
+        self._backdrop_canvas = canvas
+        self._sync_backdrop_geometry()
+
+    def _make_backdrop_clickthrough(self):
+        """Pass mouse input to the foreground HUD and the game behind it."""
+        window = self._backdrop_window
+        if window is None or not window.winfo_exists():
+            return
+        user32 = ctypes.windll.user32
+        get_root = user32.GetAncestor
+        get_root.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        get_root.restype = ctypes.c_void_p
+        hwnd = get_root(window.winfo_id(), 2)  # Tk client HWND -> actual top level
+        if not hwnd:
+            return
+        get_style = user32.GetWindowLongPtrW
+        get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        get_style.restype = ctypes.c_ssize_t
+        set_style = user32.SetWindowLongPtrW
+        set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+        set_style.restype = ctypes.c_ssize_t
+        extended = get_style(hwnd, -20)  # GWL_EXSTYLE
+        set_style(hwnd, -20, extended | 0x20 | 0x08000000)
+        # WS_EX_TRANSPARENT | WS_EX_NOACTIVATE: never steal game clicks/focus.
+
+    def _sync_backdrop_geometry(self, x: int | None = None, y: int | None = None):
+        window = self._backdrop_window
+        if window is None or not window.winfo_exists():
+            return
+        if x is None:
+            x = self.winfo_x()
+        if y is None:
+            y = self.winfo_y()
+        geometry = f"{WIDTH}x{HEIGHT}+{x}+{y}"
+        if geometry != self._backdrop_last_geometry:
+            window.geometry(geometry)
+            self._backdrop_last_geometry = geometry
+
+    def _paint_backdrop(self):
+        """Reproduce the old dark header, cards and separators under text."""
+        if self._closing or self._backdrop_canvas is None:
+            return
+        self.update_idletasks()
+        canvas = self._backdrop_canvas
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=BG, outline=BG, width=0)
+
+        def rectangle(widget, color, outline=None):
+            if not widget.winfo_exists() or not widget.winfo_ismapped():
+                return
+            x = widget.winfo_rootx() - self.winfo_rootx()
+            y = widget.winfo_rooty() - self.winfo_rooty()
+            w, h = widget.winfo_width(), widget.winfo_height()
+            if w > 0 and h > 0:
+                canvas.create_rectangle(x, y, x+w, y+h, fill=color,
+                                        outline=outline or color,
+                                        width=1 if outline else 0)
+
+        rectangle(self._hud_header, HEADER)
+        rectangle(self._hud_divider, "#314150")
+        rectangle(self._hud_haste_row, HEADER)
+        for card in self._hud_card_frames:
+            rectangle(card, HEADER, "#2b404f")
+        rectangle(self.new_session_button, "#315943")
+        canvas.create_rectangle(0, 0, WIDTH-1, HEIGHT-1,
+                                outline="#354554", width=1)
+        self._backdrop_needs_paint = False
+
+    def _apply_backdrop(self, enabled: bool, opacity: float | None = None):
+        """Only background alpha changes; text's actual HWND stays at 255."""
+        window = self._backdrop_window
+        if window is None or not window.winfo_exists():
+            return
+        window.attributes("-alpha", clamp_alpha(
+            self.config_data.get("overlay_alpha", .55) if opacity is None
+            else opacity))
+        if enabled:
+            self._sync_backdrop_geometry()
+            if window.state() == "withdrawn":
+                window.deiconify()
+                self._make_backdrop_clickthrough()
+            window.lift()
+            # Keep the solid background BEHIND the transparent text window.
+            self.lift(window)
+            if self._backdrop_needs_paint:
+                self.after(50, self._paint_backdrop)
         else:
-            self.attributes("-alpha", clamp_alpha(
-                self.config_data.get("overlay_alpha", 0.55) if opacity is None
-                else opacity))
+            window.withdraw()
 
     def _make_ui(self):
         outer = tk.Frame(self, bg=BG, highlightbackground="#354554", highlightthickness=1)
         outer.pack(fill="both", expand=True)
         header = tk.Frame(outer, bg=HEADER, height=38)
+        self._hud_header = header
         header.pack(fill="x")
         header.pack_propagate(False)
         self.level_text = self._label(header, "Lv.31 · —%", 12, FG, True, HEADER)
         self.level_text.pack(side="left", padx=(13, 0))
         self._drag_bind(header)
         self._drag_bind(self.level_text)
-        self._icon_button(header, "닫기", self.close, color="#bac9d4").pack(side="right", padx=(0, 3))
-        self._icon_button(header, "설정", self.show_settings, color="#bac9d4").pack(side="right")
+        self._icon_button(header, "닫기", self.close, color=FG).pack(side="right", padx=(0, 3))
+        self._icon_button(header, "설정", self.show_settings, color=FG).pack(side="right")
         self._icon_button(header, "재검", self.rescan, color=ACCENT).pack(side="right")
         self.background_button = self._icon_button(
             header, "배경", self.toggle_background,
-            color=ACCENT if self.config_data.get("transparent_bg", True) else MUTED)
+            color=ACCENT if self.config_data.get("backdrop_enabled", True) else MUTED)
         self.background_button.pack(side="right")
         self.pin_button = self._icon_button(header, "고정", self.toggle_pin,
                                             color=ACCENT if self.config_data.get("always_top", True) else MUTED)
@@ -338,7 +446,8 @@ class OverlayApp(tk.Tk):
         self.state_text.pack(anchor="e")
         self._drag_bind(right)
 
-        tk.Frame(outer, bg="#314150", height=1).pack(fill="x", padx=15, pady=(0, 8))
+        self._hud_divider = tk.Frame(outer, bg="#314150", height=1)
+        self._hud_divider.pack(fill="x", padx=15, pady=(0, 8))
         metrics = tk.Frame(outer, bg=BG)
         metrics.pack(fill="x", padx=15)
         self.hour_text = self._label(metrics, "1시간 예상 —", 11, FG, True)
@@ -348,6 +457,7 @@ class OverlayApp(tk.Tk):
         self._drag_bind(metrics)
 
         haste_row = tk.Frame(outer, bg=HEADER, height=31)
+        self._hud_haste_row = haste_row
         haste_row.pack(fill="x", padx=12, pady=(6, 0))
         haste_row.pack_propagate(False)
         self.haste_status_text = self._label(haste_row, "헤이스트 감시 준비 중", 11,
@@ -376,9 +486,11 @@ class OverlayApp(tk.Tk):
         timer_grid.grid_columnconfigure(0, weight=1, uniform="counter")
         timer_grid.grid_columnconfigure(1, weight=1, uniform="counter")
         self.timer_widgets = {}
+        self._hud_card_frames = []
         for index, (minutes, _) in enumerate(TIMERS):
             card = tk.Frame(timer_grid, bg=HEADER, height=74,
                             highlightbackground="#2b404f", highlightthickness=1)
+            self._hud_card_frames.append(card)
             card.grid(row=index // 2, column=index % 2, sticky="ew", padx=3, pady=3)
             card.grid_propagate(False)
             first = tk.Frame(card, bg=HEADER)
@@ -405,10 +517,13 @@ class OverlayApp(tk.Tk):
     def _drag_move(self, event):
         if self._drag_origin:
             x, y = self._drag_origin
-            self.geometry(f"+{event.x_root - x}+{event.y_root - y}")
+            new_x, new_y = event.x_root - x, event.y_root - y
+            self.geometry(f"+{new_x}+{new_y}")
+            self._sync_backdrop_geometry(new_x, new_y)
 
     def _drag_end(self, event):
         self._drag_origin = None
+        self._sync_backdrop_geometry()
         self.config_data["overlay_geometry"] = [self.winfo_x(), self.winfo_y()]
         save_config(self.config_data)
 
@@ -416,15 +531,19 @@ class OverlayApp(tk.Tk):
         enabled = not bool(self.config_data.get("always_top", True))
         self.config_data["always_top"] = enabled
         self.attributes("-topmost", enabled)
+        if self._backdrop_window is not None:
+            self._backdrop_window.attributes("-topmost", enabled)
+            if self.config_data.get("backdrop_enabled", True):
+                self.lift(self._backdrop_window)
         self.pin_button.configure(fg=ACCENT if enabled else MUTED)
         save_config(self.config_data)
 
     def toggle_background(self):
-        """Quick-switch: completely clear HUD or classic translucent cards."""
-        transparent = not bool(self.config_data.get("transparent_bg", True))
-        self.config_data["transparent_bg"] = transparent
-        self._apply_hud_transparency(transparent)
-        self.background_button.configure(fg=ACCENT if transparent else MUTED)
+        """Quick-switch between shaded HUD and bare opaque text."""
+        enabled = not bool(self.config_data.get("backdrop_enabled", True))
+        self.config_data["backdrop_enabled"] = enabled
+        self._apply_backdrop(enabled)
+        self.background_button.configure(fg=ACCENT if enabled else MUTED)
         save_config(self.config_data)
 
     def start_new_session(self):
@@ -874,6 +993,8 @@ class OverlayApp(tk.Tk):
             self._picker_window.lift()
             return
         # Hiding this overlay prevents its pixels from contaminating the crop.
+        if self._backdrop_window is not None:
+            self._backdrop_window.withdraw()
         self.withdraw()
 
         def capture():
@@ -885,9 +1006,11 @@ class OverlayApp(tk.Tk):
                     snapshot = grab_game(info)
             except Exception as error:
                 self.deiconify()
+                self._apply_backdrop(bool(self.config_data.get("backdrop_enabled", True)))
                 messagebox.showerror("캡처 실패", str(error), parent=self)
                 return
             self.deiconify()
+            self._apply_backdrop(bool(self.config_data.get("backdrop_enabled", True)))
             win = ExpRegionPicker(self, snapshot, self.exp_roi, self._save_region)
             self._picker_window = win
             def reset_picker(event):
@@ -914,27 +1037,27 @@ class OverlayApp(tk.Tk):
                          highlightthickness=0, relief="flat", font=self._font(13))
         level.insert(0, str(self.reading_level))
         level.pack(fill="x", padx=18, pady=(3, 9), ipady=5)
-        transparent = tk.BooleanVar(value=bool(self.config_data.get("transparent_bg", True)))
+        backdrop_enabled = tk.BooleanVar(value=bool(self.config_data.get("backdrop_enabled", True)))
         opacity = tk.DoubleVar(value=clamp_alpha(self.config_data.get("overlay_alpha", .55)))
         def sync_background():
-            self._apply_hud_transparency(transparent.get(), opacity.get())
-            transparency.configure(state="disabled" if transparent.get() else "normal")
+            self._apply_backdrop(backdrop_enabled.get(), opacity.get())
+            transparency.configure(state="normal" if backdrop_enabled.get() else "disabled")
 
-        tk.Checkbutton(win, text="배경 완전 투명 (글자·숫자 100% 선명)",
-                       variable=transparent, command=sync_background,
+        tk.Checkbutton(win, text="어두운 배경 표시 (글자는 항상 선명)",
+                       variable=backdrop_enabled, command=sync_background,
                        bg=BG, fg=ACCENT, activebackground=BG,
                        activeforeground=ACCENT, selectcolor=HEADER,
                        font=self._font(11, "bold")).pack(anchor="w", padx=16, pady=(3, 6))
-        self._label(win, "기존 배경 불투명도 (완전 투명 해제 시)", 10, MUTED).pack(
+        self._label(win, "배경 불투명도 (55% = 가장 투명)", 10, MUTED).pack(
             anchor="w", padx=18)
         transparency = tk.Scale(win, from_=0.55, to=1.0, resolution=.05,
                                 orient="horizontal", variable=opacity,
-                                command=lambda x: self._apply_hud_transparency(
-                                    False, float(x)) if not transparent.get() else None,
+                                command=lambda x: self._apply_backdrop(
+                                    True, float(x)) if backdrop_enabled.get() else None,
                                 bg=BG, fg=MUTED, highlightthickness=0, troughcolor=HEADER,
                                 length=280, showvalue=False)
         transparency.pack(padx=18, fill="x")
-        transparency.configure(state="disabled" if transparent.get() else "normal")
+        transparency.configure(state="normal" if backdrop_enabled.get() else "disabled")
         top = tk.BooleanVar(value=bool(self.config_data.get("always_top", True)))
         retry = tk.BooleanVar(value=bool(self.config_data.get("auto_rescan", True)))
         haste_alert = tk.BooleanVar(value=bool(self.config_data.get("haste_alert", True)))
@@ -962,13 +1085,15 @@ class OverlayApp(tk.Tk):
             level_changed = new_level != self.reading_level
             self.reading_level = new_level
             self.config_data.update(level=new_level, overlay_alpha=clamp_alpha(opacity.get()),
-                                    transparent_bg=transparent.get(),
+                                    backdrop_enabled=backdrop_enabled.get(),
                                     always_top=top.get(), auto_rescan=retry.get(),
                                     haste_alert=haste_alert.get())
-            self._apply_hud_transparency(transparent.get(), opacity.get())
+            self._apply_backdrop(backdrop_enabled.get(), opacity.get())
             self.attributes("-topmost", top.get())
+            if self._backdrop_window is not None:
+                self._backdrop_window.attributes("-topmost", top.get())
             self.pin_button.configure(fg=ACCENT if top.get() else MUTED)
-            self.background_button.configure(fg=ACCENT if transparent.get() else MUTED)
+            self.background_button.configure(fg=ACCENT if backdrop_enabled.get() else MUTED)
             save_config(self.config_data)
             self._show_haste_status()
             win.destroy()
@@ -986,7 +1111,7 @@ class OverlayApp(tk.Tk):
                   font=self._font(10, "bold")).pack(fill="x", padx=18, ipady=5)
         def cancel():
             # Background previews are reversible without saving settings.
-            self._apply_hud_transparency(bool(self.config_data.get("transparent_bg", True)))
+            self._apply_backdrop(bool(self.config_data.get("backdrop_enabled", True)))
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", cancel)
@@ -1042,6 +1167,8 @@ class OverlayApp(tk.Tk):
         self.store.close()
         self.config_data["overlay_geometry"] = [self.winfo_x(), self.winfo_y()]
         save_config(self.config_data)
+        if self._backdrop_window is not None and self._backdrop_window.winfo_exists():
+            self._backdrop_window.destroy()
         self.destroy()
 
 
