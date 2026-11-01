@@ -31,9 +31,10 @@ from window_capture import GameWindowCapture
 from timed_exp import ExpTimerSet, TIMERS, LABELS
 from haste_buff import HasteMatcher, HasteState, beep_haste_expired
 from exp_picker import ExpRegionPicker
+from diagnostics import DiagnosticJournal
 
 
-VERSION = "1.9.6"
+VERSION = "1.9.7"
 APP_NAME = "글클메 사냥 트래커"
 BASE = Path(os.environ.get("MAPLE_TRACKER_DATA_DIR") or
             (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MapleHuntTracker"))
@@ -157,9 +158,11 @@ class OverlayApp(tk.Tk):
         self.reading_level = int(self.config_data.get("level", 31))
         self.exp_roi = self.config_data.get("exp_roi", list(DEFAULT_EXP_REGION))
         self.capture = GameWindowCapture(self.exp_roi)
+        self.diagnostics = DiagnosticJournal(BASE)
         self.haste_monitor = HasteState()
         self.haste_status = "waiting"
         self.haste_confidence = 0.0
+        self.last_haste_sample_at: float | None = None
         self.haste_matcher_error = ""
         try:
             self.haste_matcher = HasteMatcher()
@@ -399,6 +402,7 @@ class OverlayApp(tk.Tk):
         # Rescans never clear accumulated EXP or reset the timer.
         self.rescan_event.set()
         self.scan_status = "수동 재스캔 요청"
+        self.diagnostics.write("manual_rescan")
         self._show_values()
 
     def test_haste_sound(self):
@@ -407,7 +411,10 @@ class OverlayApp(tk.Tk):
 
     def _show_haste_status(self):
         status = self.haste_status
-        if status == "active":
+        if (self.last_haste_sample_at is not None and
+                time.monotonic() - self.last_haste_sample_at > 5.0):
+            label, color = "헤이스트 화면 캡처 대기", WARNING
+        elif status == "active":
             label, color = "헤이스트 적용 중", ACCENT
         elif status == "checking":
             label, color = "헤이스트 종료 확인 중", WARNING
@@ -470,10 +477,10 @@ class OverlayApp(tk.Tk):
                     recovery = RecoveryPolicy()
                 if self.rescan_event.is_set():
                     self.rescan_event.clear()
-                    # A new WGC source often fixes a frozen/missed OCR read.
-                    self.capture.stop()
+                    # Rescan the OCR, NOT the shared WGC source. Restarting
+                    # capture on a font/OCR error interrupted Haste too.
                     last_frame = 0.0
-                    self.event_queue.put(("status", "캡처 연결 재설정 중"))
+                    self.event_queue.put(("status", "경험치 재인식 중"))
                 info = game_info()
                 if info is None:
                     self.event_queue.put(("status", "메이플 창 대기"))
@@ -544,6 +551,8 @@ class OverlayApp(tk.Tk):
                         now = time.monotonic()
                         if now - last_rejection_notice >= 2:
                             self.event_queue.put(("exp_rejected", session_id, reason))
+                            self.diagnostics.write("exp_ocr_rejected", reason=reason,
+                                                   level=current_level, exp=result[0])
                             last_rejection_notice = now
                         result = None
                 if result is not None:
@@ -558,9 +567,13 @@ class OverlayApp(tk.Tk):
                     restart = recovery.failure(now, last_valid_scan,
                                                 self.config_data.get("auto_rescan", True))
                     if restart:
-                        self.capture.stop()
-                        last_frame = 0.0
-                        self.event_queue.put(("retry", "OCR 자동 재스캔 · 캡처 재연결"))
+                        # Keep the healthy shared image stream alive. The
+                        # capture manager independently reconnects only if
+                        # frames are genuinely stale for several seconds.
+                        self.event_queue.put(("retry", "OCR 재시도 · 캡처 유지"))
+                        self.diagnostics.write("exp_ocr_retry",
+                                               last_exp=hunt.current_exp,
+                                               capture_generation=self.capture.generation)
                     elif recovery.failures == 2:
                         self.event_queue.put(("status", "경험치 재인식 시도 중"))
             except Exception as error:
@@ -571,10 +584,23 @@ class OverlayApp(tk.Tk):
         """Independent HUD watcher so OCR delays do not postpone the beep."""
         last_buff_frame = 0.0
         last_error = ""
+        consecutive_errors = 0
+        error_notified = False
+        last_generation = None
+        capture_grace_until = 0.0
         while not self.stop_event.is_set():
             try:
                 info = game_info()
                 if info is not None and self.capture.ensure(info.hwnd):
+                    generation = self.capture.generation
+                    if generation != last_generation:
+                        if last_generation is not None:
+                            self.haste_monitor.suspend_capture()
+                            self.diagnostics.write(
+                                "haste_capture_reconnected", generation=generation)
+                        last_generation = generation
+                        last_buff_frame = 0.0
+                        capture_grace_until = time.monotonic() + 1.0
                     buff, timestamp = self.capture.buff_snapshot()
                     # Never count missing/broken/cached captures as a vanished
                     # buff. Only a newer screenshot is meaningful evidence.
@@ -583,18 +609,48 @@ class OverlayApp(tk.Tk):
                         last_buff_frame = timestamp
                         icon = self.haste_matcher.match(
                             buff, info.height,
-                            last_position=self.haste_monitor.last_position)
+                            last_position=(self.haste_monitor.last_position
+                                           if self.haste_monitor.state in ("active", "checking")
+                                           else None))
+                        self.last_haste_sample_at = time.monotonic()
+                        # A restarted WGC source can briefly deliver blank
+                        # frames. Never interpret them as buff removal.
+                        if not icon.visible and self.last_haste_sample_at < capture_grace_until:
+                            continue
                         previous_state = self.haste_monitor.state
                         ended = self.haste_monitor.update(icon, now=timestamp)
                         status = self.haste_monitor.state
+                        if consecutive_errors:
+                            self.diagnostics.write(
+                                "haste_worker_recovered", after_errors=consecutive_errors,
+                                confidence=round(icon.score, 3))
+                            self.event_queue.put(("haste", status, icon.score, False))
+                            consecutive_errors = 0
+                            error_notified = False
                         if status != previous_state or ended:
+                            self.diagnostics.write(
+                                "haste_transition", old=previous_state, new=status,
+                                confidence=round(icon.score, 3),
+                                position=icon.position,
+                                generation=generation, alarm=ended)
+                        # Show 'checking' only after multiple missing frames.
+                        # A single bad frame must not flicker the overlay.
+                        if ((status != previous_state and status != "checking") or
+                                (status == "checking" and self.haste_monitor.missing_count == 3)
+                                or ended):
                             self.event_queue.put(("haste", status, icon.score, ended))
                         last_error = ""
             except Exception as error:
                 # Isolate the buff watcher from the original EXP OCR engine.
+                consecutive_errors += 1
                 if str(error) != last_error:
-                    self.event_queue.put(("haste_error", str(error)))
+                    self.diagnostics.write("haste_worker_error", error=str(error))
                     last_error = str(error)
+                # A single failed template comparison is not a broken Haste
+                # feature. Mark an error only after sustained exceptions.
+                if consecutive_errors >= 8 and not error_notified:
+                    self.event_queue.put(("haste_error", str(error)))
+                    error_notified = True
             # Poll fast enough to pick up the next ~200ms HUD capture without
             # an additional ~220ms watcher delay (v1.9.2 felt sluggish).
             self.stop_event.wait(0.045)
@@ -662,6 +718,7 @@ class OverlayApp(tk.Tk):
                 elif kind == "error":
                     self.ocr_error = message[1]
                     self.scan_status = "OCR 오류 · 재시도 중"
+                    self.diagnostics.write("exp_worker_error", error=message[1])
                     changed = True
             now = time.monotonic()
             if changed or now - self.last_redraw > 0.75:

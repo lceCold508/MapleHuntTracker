@@ -85,6 +85,7 @@ class HuntSession:
         self.paused_at: float | None = None
         self.paused_total = 0.0
         self.last_sample_at = 0.0
+        self.last_exp_at: float | None = None
         # Around 2 EXP reads/sec is supported. Keep more than an hour of
         # samples for the 60-minute rate/graph without unbounded allocations.
         self.samples: deque[Sample] = deque(maxlen=10000)
@@ -229,6 +230,13 @@ class HuntSession:
             # visible "새 세션" control to re-anchor after losing EXP.
             if level == self.level and delta < 0:
                 return False
+            if level == self.level and self.last_exp_at is not None:
+                elapsed_since = max(0.0, self.elapsed() - self.last_exp_at)
+                # A single OCR sample must not produce over 100K EXP in a
+                # few seconds. Allow a generous catch-up rate when the game
+                # was temporarily hidden/uncapturable, but reject wild jumps.
+                if delta > max(2500, 750 * elapsed_since):
+                    return False
             # One OCR reading cannot plausibly supply >1.5 full levels.
             if delta > max(25000, int((limit or 10000) * 1.5)):
                 return False
@@ -237,6 +245,7 @@ class HuntSession:
             self.initial_exp = exp
         self.level, self.current_exp, self.current_pct = level, exp, pct
         self.latest_total_exp = total
+        self.last_exp_at = self.elapsed()
         self._sample()
         return True
 

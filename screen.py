@@ -189,7 +189,9 @@ def _screen_exp_candidates(text: str, level: int) -> list[tuple[int, float | Non
     # EXP number, but only accept it with a second OCR vote or recent value.
     suffix = right.split("%", 1)[0].split("/", 1)[0].split("+", 1)[0]
     pct_digits = re.sub(r"[^0-9]", "", suffix[:11])
-    pct = float(int(pct_digits) / 100) if 2 <= len(pct_digits) <= 5 else None
+    # Two digits without the separator are ambiguous, e.g. OCR
+    # '1 13,543 [31 +38+41' is NOT evidence of 0.31% experience.
+    pct = float(int(pct_digits) / 100) if 3 <= len(pct_digits) <= 5 else None
     if pct is not None and not 0 <= pct <= 100:
         pct = None
     amounts = []
@@ -239,17 +241,23 @@ def read_exp(img: Image.Image, level: int, last_exp: int | None = None
                 continue
             if req:
                 if pct is None:
+                    # Amount-only OCR is unsafe to use as the initial session
+                    # baseline. In real gameplay, a tightly cropped '113,543'
+                    # was repeatedly misread as '1' by *multiple* variants.
+                    # Permit this fallback only near the already-known EXP.
+                    if last_exp is None or abs(exp - last_exp) > max(2000, int(req * .02)):
+                        continue
                     # Only allow amount-only OCR if it has strong corroboration.
                     observed_without_pct[exp] = observed_without_pct.get(exp, 0) + 1
-                    if (observed_without_pct[exp] < 2
-                        and (last_exp is None or abs(exp - last_exp) > 1000)):
+                    if observed_without_pct[exp] < 2:
                         continue
-                    discrepancy = 0.30
+                    discrepancy = 0.12
                     pct = round(exp / req * 100, 2)
                 else:
                     discrepancy = abs(exp / req * 100 - pct)
-                    # Reject wrong amounts and bad percent readings.
-                    if discrepancy > 0.55:
+                    # A real percentage rounded to 2 decimals agrees within
+                    # ~0.005%; 0.55% admitted '1 EXP / 0.31%' false positives.
+                    if discrepancy > 0.18:
                         continue
             else:
                 discrepancy = 0.0

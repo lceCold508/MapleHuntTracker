@@ -28,10 +28,13 @@ PRESENT_CONFIRM_FRAMES = 2
 # interval observed during diagnostics was the player manually removing and
 # reapplying Haste, not an animation. Keep the alert prompt once it truly goes
 # away, with short evidence-based debounce rather than the interim 8s delay.
-# Three *fresh* missing frames at ~0.2s capture cadence: the original two
-# frames triggered repeatedly when the yellow countdown obscured Haste.
-ABSENT_CONFIRM_FRAMES = 3
-ABSENT_CONFIRM_SECONDS = 0.38
+# Screen capture and icon animations can occasionally produce one to three
+# consecutive low-confidence frames. Do not show buff loss or beep until the
+# icon has actually been absent for around one second.
+ABSENT_CONFIRM_FRAMES = 4
+ABSENT_CONFIRM_SECONDS = 0.82
+LOCAL_CONFIRM_THRESHOLD = 0.82
+LOCAL_CONFIRM_COLOR_THRESHOLD = 0.955
 # The countdown overlays the center/lower 2/3 of the reference icon. Match
 # the unoccluded border/upper sprite separately as a fallback.
 NUMBER_MASKED_CORR_THRESHOLD = 0.94
@@ -91,6 +94,44 @@ class HasteMatcher:
             result.append(self._scaled[size])
         return result
 
+    @staticmethod
+    def _safe_masked_match(image: np.ndarray, template: np.ndarray,
+                           mask: np.ndarray, method: int) -> np.ndarray | None:
+        """A masked OpenCV match may fail on transient frames / driver paths.
+
+        Never let one OpenCV exception kill or permanently disable the Haste
+        watcher. Skip the problematic candidate and try the next frame.
+        """
+        ih, iw = image.shape[:2]
+        th, tw = template.shape[:2]
+        if ih < th or iw < tw or mask.shape[:2] != (th, tw):
+            return None
+        try:
+            result = cv2.matchTemplate(image, template, method, mask=mask)
+        except cv2.error:
+            # The recurring OpenCV 5 matchTemplateMask assertion can also
+            # occur for an otherwise valid same-size 50x50 candidate patch.
+            # Calculate its masked similarity directly with NumPy so the
+            # known Haste countdown remains detectable instead of dropping
+            # the icon for one or more seconds.
+            if (ih, iw) != (th, tw) or method not in (
+                    cv2.TM_CCORR_NORMED, cv2.TM_CCOEFF_NORMED):
+                return None
+            enabled = mask > 0
+            if not np.any(enabled):
+                return None
+            original = image[enabled].astype(np.float64).reshape(-1)
+            reference = template[enabled].astype(np.float64).reshape(-1)
+            if method == cv2.TM_CCOEFF_NORMED:
+                original -= original.mean()
+                reference -= reference.mean()
+            denominator = float(np.linalg.norm(original) * np.linalg.norm(reference))
+            if denominator < 1e-12:
+                return None
+            score = float(np.clip(np.dot(original, reference) / denominator, -1, 1))
+            return np.array([[score]], dtype=np.float32)
+        return result if result is not None and result.size else None
+
     def _countdown_at_position(self, frame: np.ndarray, full_frame_height: int,
                                position: tuple[int, int] | None) -> MatchResult | None:
         """Keep Haste active when yellow countdown covers its last icon slot.
@@ -122,10 +163,51 @@ class HasteMatcher:
                               & (r.astype(np.int16) > b.astype(np.int16) * 1.6))
                     if np.count_nonzero(yellow) < required_yellow:
                         continue
-                    coeff = float(cv2.matchTemplate(
-                        patch, template, cv2.TM_CCOEFF_NORMED, mask=mask)[0, 0])
+                    matched = self._safe_masked_match(
+                        patch, template, mask, cv2.TM_CCOEFF_NORMED)
+                    if matched is None:
+                        continue
+                    coeff = float(matched[0, 0])
                     if np.isfinite(coeff) and coeff >= COUNTDOWN_BORDER_COEFF_THRESHOLD:
                         return MatchResult(True, min(1.0, max(0.87, coeff)), (x, y))
+        return None
+
+    def _known_slot_match(self, frame: np.ndarray, full_frame_height: int,
+                          position: tuple[int, int] | None) -> MatchResult | None:
+        """Fast, stable detection around an already-confirmed Haste HUD slot.
+
+        Rechecking the known slot before doing a full HUD search avoids
+        confusing unrelated status icons and the entire screen during brief
+        yellow-number animation frames. The borderline threshold is only
+        accepted when the candidate has strong color similarity too.
+        """
+        if position is None:
+            return None
+        tolerance = max(2, round(4 * full_frame_height / REFERENCE_HEIGHT))
+        x0, y0 = position
+        best = (-1.0, None)
+        for template in self._variants(full_frame_height):
+            height, width = template.shape[:2]
+            for dy in (0, -tolerance, tolerance):
+                for dx in (0, -tolerance, tolerance):
+                    x, y = x0 + dx, y0 + dy
+                    if (x < 0 or y < 0 or x + width > frame.shape[1]
+                            or y + height > frame.shape[0]):
+                        continue
+                    patch = frame[y:y + height, x:x + width]
+                    coeff = float(cv2.matchTemplate(
+                        patch, template, cv2.TM_CCOEFF_NORMED)[0, 0])
+                    if not np.isfinite(coeff) or coeff < LOCAL_CONFIRM_THRESHOLD:
+                        continue
+                    if coeff < self.threshold:
+                        corr = float(cv2.matchTemplate(
+                            patch, template, cv2.TM_CCORR_NORMED)[0, 0])
+                        if not np.isfinite(corr) or corr < LOCAL_CONFIRM_COLOR_THRESHOLD:
+                            continue
+                    if coeff > best[0]:
+                        best = (coeff, (x, y))
+        if best[1] is not None:
+            return MatchResult(True, best[0], best[1])
         return None
 
     def match(self, image: Image.Image, full_frame_height: int,
@@ -133,6 +215,9 @@ class HasteMatcher:
         if image.width < 70 or image.height < 30:
             return MatchResult(False, 0.0, None)
         frame = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+        local = self._known_slot_match(frame, full_frame_height, last_position)
+        if local is not None:
+            return local
         best_score = -1.0
         best_point = None
         for template in self._variants(full_frame_height):
@@ -157,15 +242,20 @@ class HasteMatcher:
             if frame.shape[0] < h or frame.shape[1] < w:
                 continue
             mask = self._scaled_masks[(w, h)]
-            color_score = cv2.matchTemplate(frame, template,
-                                            cv2.TM_CCORR_NORMED, mask=mask)
+            color_score = self._safe_masked_match(
+                frame, template, mask, cv2.TM_CCORR_NORMED)
+            if color_score is None:
+                continue
             _, corr, _, position = cv2.minMaxLoc(color_score)
             if corr < NUMBER_MASKED_CORR_THRESHOLD:
                 continue
             x, y = position
             candidate = frame[y:y+h, x:x+w]
-            coeff = float(cv2.matchTemplate(candidate, template,
-                                            cv2.TM_CCOEFF_NORMED, mask=mask)[0, 0])
+            matched = self._safe_masked_match(
+                candidate, template, mask, cv2.TM_CCOEFF_NORMED)
+            if matched is None:
+                continue
+            coeff = float(matched[0, 0])
             if (np.isfinite(coeff) and coeff >= NUMBER_MASKED_COEFF_THRESHOLD
                     and corr > masked_score):
                 masked_score = float(corr)
@@ -196,6 +286,12 @@ class HasteState:
         self.last_visible_at: float | None = None
         self.last_position: tuple[int, int] | None = None
         self.last_observed_at: float | None = None
+
+    def suspend_capture(self) -> None:
+        """Clear a half-confirmed disappearance after WGC source disruption."""
+        self.missing_count = 0
+        if self.state == "checking":
+            self.state = "active"
 
     def update(self, match: MatchResult, now: float | None = None) -> bool:
         """Returns True exactly once per confirmed active->expired transition."""

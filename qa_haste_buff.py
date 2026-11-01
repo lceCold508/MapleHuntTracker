@@ -4,11 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 from PIL import Image, ImageDraw, ImageFont
 
 from haste_buff import (HasteMatcher, HasteState, MatchResult,
                         beep_haste_expired, DEFAULT_MATCH_THRESHOLD,
-                        ABSENT_CONFIRM_SECONDS)
+                        ABSENT_CONFIRM_SECONDS, ABSENT_CONFIRM_FRAMES)
 
 
 def check_matching():
@@ -140,7 +141,8 @@ def check_transitions():
     assert not state.update(no, 10.8)
     assert state.state == "checking"
     assert not state.update(no, 11.02)
-    assert state.update(no, 11.24)
+    assert not state.update(no, 11.24)
+    assert state.update(no, 11.46)
     assert state.state == "expired"
     assert not state.update(no, 11.3)
     assert not state.update(yes, 17.0)
@@ -148,14 +150,16 @@ def check_transitions():
     assert state.state == "active"  # new buff re-arms automatically
     assert not state.update(no, 17.4)
     assert not state.update(no, 17.62)
-    assert state.update(no, 17.84)
+    assert not state.update(no, 17.84)
+    assert state.update(no, 18.06)
     assert state.state == "expired"
-    assert ABSENT_CONFIRM_SECONDS == 0.38
+    assert ABSENT_CONFIRM_SECONDS == 0.82
+    assert ABSENT_CONFIRM_FRAMES == 4
     print("HASTE_TRANSITIONS_PASS")
 
 
 def check_fast_alarm_latency():
-    """At 200ms capture cadence, real loss alerts within about 0.6-0.8s."""
+    """Reject brief glitches; true loss alerts in about one second."""
     visible = MatchResult(True, .97, (1458, 20))
     missing = MatchResult(False, .43, None)
     monitor = HasteState()
@@ -168,11 +172,79 @@ def check_fast_alarm_latency():
     disappeared_at = 101.0
     assert not monitor.update(missing, disappeared_at)
     assert not monitor.update(missing, 101.2)
-    alert_at = 101.4
-    assert monitor.update(missing, alert_at)
-    assert alert_at - disappeared_at < .6
+    assert not monitor.update(missing, 101.4)
     assert not monitor.update(missing, 101.6)
+    alert_at = 101.8
+    assert monitor.update(missing, alert_at)
+    assert alert_at - disappeared_at < 1.1
+    assert not monitor.update(missing, 102.0)
     print("FAST_HASTE_ALERT_PASS", round(alert_at - disappeared_at, 2))
+
+
+def check_capture_restart_safety():
+    yes = MatchResult(True, 0.97, (1458, 20))
+    no = MatchResult(False, 0.37, None)
+    state = HasteState()
+    assert not state.update(yes, 10)
+    assert not state.update(yes, 10.2)
+    assert state.state == "active"
+    assert not state.update(no, 10.4)
+    assert state.state == "checking"
+    state.suspend_capture()
+    assert state.state == "active"
+    assert state.missing_count == 0
+    assert not state.update(yes, 11)
+    assert state.state == "active"
+    assert not state.update(no, 11.2)
+    assert not state.update(yes, 11.4)
+    assert state.state == "active"
+    print("HASTE_CAPTURE_RESTART_SAFETY_PASS")
+
+
+def check_known_slot_stability():
+    fixture = Path(__file__).resolve().parent / "assets" / "qa_fixtures" / "haste-top-right-now.png"
+    frame = Image.open(fixture).convert("RGB")
+    matcher = HasteMatcher()
+    normal = matcher.match(frame, 2160)
+    assert normal.visible and normal.position is not None
+    anchored = matcher.match(frame, 2160, last_position=normal.position)
+    assert anchored.visible and anchored.position == normal.position, (normal, anchored)
+    print("HASTE_KNOWN_SLOT_STABILITY_PASS", round(anchored.score, 3))
+
+
+def check_masked_opencv_error_recovery():
+    """Reproduce the actual OpenCV 5 matchTemplateMask exception in logs."""
+    fixture = Path(__file__).resolve().parent / "assets" / "qa_fixtures" / "haste-top-right-now.png"
+    image = Image.open(fixture).convert("RGB")
+    matcher = HasteMatcher(threshold=1.1)
+    native = cv2.matchTemplate
+    masked_attempts = []
+
+    def intermittent_opencv_failure(frame, template, method, *args, **kwargs):
+        if "mask" in kwargs:
+            masked_attempts.append(1)
+            raise cv2.error("OpenCV matchTemplateMask simulated transient failure")
+        return native(frame, template, method, *args, **kwargs)
+
+    with patch("haste_buff.cv2.matchTemplate", side_effect=intermittent_opencv_failure):
+        result = matcher.match(image, 2160)
+    assert masked_attempts, "The masked path must actually have been exercised"
+    assert not result.visible, result
+
+    # Even when OpenCV's masked implementation is unavailable, an icon with
+    # yellow countdown digits must remain visible at its previously verified
+    # slot through the safe NumPy same-sized-patch fallback.
+    confirmed = HasteMatcher().match(image, 2160)
+    assert confirmed.visible and confirmed.position is not None
+    with patch.object(matcher, "_known_slot_match", return_value=None):
+        with patch("haste_buff.cv2.matchTemplate", side_effect=intermittent_opencv_failure):
+            rescued = matcher.match(image, 2160, last_position=confirmed.position)
+    assert rescued.visible and rescued.position == confirmed.position, rescued
+
+    # The same model must recover immediately on the next normal screenshot.
+    recovered = HasteMatcher().match(image, 2160)
+    assert recovered.visible and recovered.score > .94
+    print("HASTE_OPENCV_MASK_ERROR_RECOVERY_PASS", len(masked_attempts))
 
 
 def check_real_manual_recast():
@@ -223,5 +295,8 @@ if __name__ == "__main__":
     check_countdown_forced_fallback()
     check_transitions()
     check_fast_alarm_latency()
+    check_capture_restart_safety()
+    check_known_slot_stability()
+    check_masked_opencv_error_recovery()
     check_real_manual_recast()
     check_beep()

@@ -10,11 +10,23 @@ import time
 from PIL import Image
 
 
+def expanded_exp_roi(roi):
+    """Add original-screen breathing room around a tightly dragged EXP HUD.
+
+    A 4K 302x53 ROI selected around the text itself cut off its first digits,
+    yielding OCR readings of 1 or 1,106 instead of 113,543. Keep the user's
+    saved rectangle untouched; expand only the screenshot sent to OCR.
+    """
+    x1, y1, x2, y2 = (float(v) for v in roi)
+    return (max(0.0, x1 - 0.018), max(0.0, y1 - 0.008),
+            min(1.0, x2 + 0.018), min(1.0, y2 + 0.008))
+
+
 class GameWindowCapture:
     def __init__(self, exp_roi):
         self._lock = threading.Lock()
         self._manager_lock = threading.Lock()
-        self._exp_roi = tuple(exp_roi)
+        self._exp_roi = expanded_exp_roi(exp_roi)
         # The game HUD places buffs in the top-right. Capture a separate
         # small crop for frequent icon detection without affecting EXP OCR.
         self._buff_roi = (0.60, 0.0, 1.0, 0.12)
@@ -32,6 +44,8 @@ class GameWindowCapture:
         self._last_buff_copy = 0.0
         self.error = ""
         self.closed = False
+        self._generation = 0
+        self._started_at = 0.0
 
     @staticmethod
     def _to_pil(frame):
@@ -43,15 +57,27 @@ class GameWindowCapture:
 
     def set_exp_roi(self, roi):
         with self._lock:
-            self._exp_roi = tuple(roi)
+            self._exp_roi = expanded_exp_roi(roi)
             self._exp_image = None
             self._exp_time = 0.0
+
+    @property
+    def generation(self):
+        with self._lock:
+            return self._generation
 
     def ensure(self, hwnd):
         with self._manager_lock:
             if self._hwnd == hwnd and self._control is not None and not self.closed:
-                return True
+                with self._lock:
+                    latest = max(self._started_at, self._exp_time, self._buff_time)
+                # The WGC capture library can silently stop delivering frames
+                # without firing on_closed. Restart only for stale captures,
+                # never because EXP OCR couldn't understand a particular font.
+                if time.monotonic() - latest < 5.0:
+                    return True
             self._stop_locked()
+            generation = self._generation
             try:
                 from windows_capture import WindowsCapture
                 capture = WindowsCapture(window_hwnd=hwnd, cursor_capture=False,
@@ -62,6 +88,8 @@ class GameWindowCapture:
                 def on_frame_arrived(frame, control):
                     now = time.monotonic()
                     with self._lock:
+                        if generation != self._generation:
+                            return
                         roi = self._exp_roi
                         exp_due = now - self._last_exp_copy >= 0.28
                         buff_due = now - self._last_buff_copy >= 0.18
@@ -88,6 +116,8 @@ class GameWindowCapture:
                         if full_due:
                             full = self._to_pil(frame)
                         with self._lock:
+                            if generation != self._generation:
+                                return
                             if exp is not None:
                                 self._exp_image = exp
                                 self._exp_time = now
@@ -102,14 +132,18 @@ class GameWindowCapture:
                                 self._last_full_copy = now
                     except Exception as error:
                         with self._lock:
-                            self.error = f"캡처 프레임 처리 실패: {error}"
+                            if generation == self._generation:
+                                self.error = f"캡처 프레임 처리 실패: {error}"
 
                 @capture.event
                 def on_closed():
                     with self._lock:
-                        self.closed = True
-                        self.error = "게임 창 캡처 종료됨"
+                        if generation == self._generation:
+                            self.closed = True
+                            self.error = "게임 창 캡처 종료됨"
 
+                with self._lock:
+                    self._started_at = time.monotonic()
                 self._control = capture.start_free_threaded()
                 self._capture = capture
                 self._hwnd = hwnd
@@ -139,6 +173,8 @@ class GameWindowCapture:
         self._capture = None
         self._hwnd = None
         with self._lock:
+            self._generation += 1
+            self._started_at = 0.0
             self._exp_image = None
             self._exp_time = 0
             self._buff_image = None
